@@ -1,0 +1,22 @@
+# Byte-compiled
+__pycache__/
+*.py[cod]
+
+# Runtime data
+chrome_profile/
+downloads/
+uploads/
+workflows/
+pic/
+
+# Distribution
+dist/
+python/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store

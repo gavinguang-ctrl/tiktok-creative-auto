@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TikTok Creative Studio 自动化</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>TikTok Creative Studio 自动化</h1>
+        <p class="subtitle">自动生成 TikTok 广告视频 — 填写产品信息，一键批量生成</p>
+
+        <div class="guide-section">
+            <button class="guide-toggle" onclick="toggleGuide()">
+                <span>使用说明</span><span id="guideArrow">▼</span>
+            </button>
+            <div id="guideContent" class="guide-content hidden">
+                <h4>首次使用</h4>
+                <ol>
+                    <li>双击 <code>start.bat</code> 启动（会自动关闭并重启 Chrome）</li>
+                    <li>在弹出的 Chrome 中登录 TikTok Creative Studio</li>
+                    <li>打开 <code>http://localhost:8000</code> 开始使用</li>
+                </ol>
+                <h4>操作流程</h4>
+                <ol>
+                    <li>填写产品信息、上传图片</li>
+                    <li>选择类目和生成数量</li>
+                    <li>点击「预览提示词」确认内容</li>
+                    <li>点击「确认并执行」开始自动生成</li>
+                    <li>系统自动操作 TikTok 页面，生成完毕后可下载视频</li>
+                </ol>
+                <h4>注意事项</h4>
+                <ul>
+                    <li>Chrome 必须通过 start.bat 启动（带调试端口）</li>
+                    <li>执行期间不要手动操作 TikTok 页面</li>
+                    <li>每次生成需要 5-15 分钟，请耐心等待</li>
+                    <li>如果出错，刷新页面重新提交即可</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="history-section">
+            <h3>历史任务</h3>
+            <div id="historyList" class="history-list"></div>
+        </div>
+
+<!-- PLACEHOLDER_FORM -->
+
+        <form id="mainForm" class="form-grid">
+            <div class="form-group">
+                <label>爆款趋势类目</label>
+                <select id="category">
+                    <option value="">-- 不选择，使用默认趋势 --</option>
+                    <option value="家居用品">家居用品</option>
+                    <option value="美妆个护">美妆个护</option>
+                    <option value="服装及配饰">服装及配饰</option>
+                    <option value="健康">健康</option>
+                    <option value="家电">家电</option>
+                    <option value="运动与户外活动">运动与户外活动</option>
+                    <option value="应用">应用</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label>生成视频数量</label>
+                <input type="number" id="videoCount" min="1" max="20" value="1">
+                <span class="hint">依次选择类目下 N 个爆款趋势</span>
+            </div>
+
+            <div class="form-group">
+                <label>商品名称</label>
+                <input type="text" id="productName" placeholder="产品名称" required>
+            </div>
+
+            <div class="form-group">
+                <label>售卖价格</label>
+                <input type="text" id="productPrice" placeholder="如: ₫199,000">
+                <span class="hint-optional">可选项</span>
+            </div>
+
+            <div class="form-group full-width">
+                <label>商品详情</label>
+                <textarea id="productDetails" rows="3" placeholder="产品详细描述"></textarea>
+            </div>
+
+            <div class="form-group full-width">
+                <label>商品卖点</label>
+                <textarea id="sellingPoints" rows="2" placeholder="用分号分隔多个卖点"></textarea>
+            </div>
+
+            <div class="form-group full-width">
+                <label>产品链接</label>
+                <input type="url" id="productLink" placeholder="https://...">
+            </div>
+
+            <div class="form-group">
+                <label>售卖国家</label>
+                <select id="country">
+                    <option value="越南">越南</option>
+                    <option value="泰国">泰国</option>
+                    <option value="马来西亚">马来西亚</option>
+                    <option value="菲律宾">菲律宾</option>
+                    <option value="印尼">印尼</option>
+                    <option value="美国">美国</option>
+                    <option value="英国">英国</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label>售卖语言</label>
+                <select id="language">
+                    <option value="越南语">越南语</option>
+                    <option value="泰语">泰语</option>
+                    <option value="马来语">马来语</option>
+                    <option value="菲律宾语">菲律宾语</option>
+                    <option value="印尼语">印尼语</option>
+                    <option value="英语">英语</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label><input type="checkbox" id="subtitleEnabled" checked> 需要字幕</label>
+            </div>
+
+            <div class="form-group full-width">
+                <label>产品图片</label>
+                <input type="file" id="imageFiles" multiple accept="image/*">
+                <div id="imageList" class="file-list"></div>
+                <p class="hint-warn">❌ 不要上传带脸部的图片，截取脸部后再上传<br>✅ 要上传有手持的图片，帮助AI理解产品大小</p>
+            </div>
+
+            <div class="form-group full-width">
+                <label>产品视频</label>
+                <input type="file" id="videoFiles" multiple accept="video/*">
+                <div id="videoList" class="file-list"></div>
+                <span class="hint-optional">可选项，通常不需要上传</span>
+            </div>
+
+            <div class="form-group full-width">
+                <button type="submit" class="btn-primary">预览提示词</button>
+            </div>
+        </form>
+
+        <div id="promptPreview" class="prompt-preview hidden">
+            <h3>生成的提示词</h3>
+            <textarea id="generatedPrompt" readonly rows="10"></textarea>
+            <div class="btn-group">
+                <button type="button" class="btn-primary" onclick="confirmAndRun()">确认并执行</button>
+                <button type="button" class="btn-secondary" onclick="hidePreview()">返回修改</button>
+            </div>
+        </div>
+
+        <div id="statusPanel" class="status-panel hidden">
+            <h3>执行状态</h3>
+            <p id="loopStatus" class="loop-status"></p>
+            <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
+            <p id="statusMessage">等待中...</p>
+            <div id="resultsList" class="results-list"></div>
+        </div>
+    </div>
+
+    <script>
+    function toggleGuide() {
+        const content = document.getElementById('guideContent');
+        const arrow = document.getElementById('guideArrow');
+        content.classList.toggle('hidden');
+        arrow.textContent = content.classList.contains('hidden') ? '▼' : '▲';
+    }
+    </script>
+    <script src="/static/app.js?v=6"></script>
+</body>
+</html>
