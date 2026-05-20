@@ -41,6 +41,7 @@ function saveCurrentToHistory() {
     subtitleEnabled: document.getElementById("subtitleEnabled").checked,
     category: document.getElementById("category").value,
     videoCount: document.getElementById("videoCount").value,
+    startTrendIndex: document.getElementById("startTrendIndex").value,
     imagePaths: uploadedImagePaths,
     videoPaths: uploadedVideoPaths,
   };
@@ -65,6 +66,7 @@ function loadFromHistory(id) {
   document.getElementById("subtitleEnabled").checked = task.subtitleEnabled !== false;
   document.getElementById("category").value = task.category || "";
   document.getElementById("videoCount").value = task.videoCount || "1";
+  document.getElementById("startTrendIndex").value = task.startTrendIndex || "0";
 
   // Restore saved file paths
   uploadedImagePaths = task.imagePaths || [];
@@ -186,6 +188,7 @@ async function confirmAndRun() {
   form.append("subtitle_enabled", document.getElementById("subtitleEnabled").checked);
   form.append("category", document.getElementById("category").value);
   form.append("video_count", document.getElementById("videoCount").value);
+  form.append("start_trend_index", document.getElementById("startTrendIndex").value);
   form.append("image_paths", uploadedImagePaths.join(","));
   form.append("video_paths", uploadedVideoPaths.join(","));
 

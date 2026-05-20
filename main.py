@@ -98,6 +98,7 @@ async def run_workflow(
     subtitle_enabled: bool = Form(True),
     category: str = Form(""),
     video_count: int = Form(1),
+    start_trend_index: int = Form(0),
     image_paths: str = Form(""),
     video_paths: str = Form(""),
 ):
@@ -113,6 +114,7 @@ async def run_workflow(
         subtitle_enabled=subtitle_enabled,
         category=category,
         video_count=max(1, min(video_count, 20)),
+        start_trend_index=max(0, start_trend_index),
         image_paths=[p.strip() for p in image_paths.split(",") if p.strip()],
         video_paths=[p.strip() for p in video_paths.split(",") if p.strip()],
     )
@@ -135,6 +137,7 @@ async def _run_task(task_id: str, input_data: InputData):
 
         # For each video: complete the full flow until "正在生成视频" before moving to next
         for i in range(input_data.video_count):
+            trend_idx = input_data.start_trend_index + i
             tasks[task_id].current_video = i + 1
             tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 提交中..."
             await _broadcast(task_id, tasks[task_id].model_dump())
@@ -144,17 +147,31 @@ async def _run_task(task_id: str, input_data: InputData):
                 await _broadcast(task_id, tasks[task_id].model_dump())
 
             # Fill prompt, upload images, select trend, send
-            title = await run_scripted_steps(page, input_data, trend_index=i, on_progress=on_progress)
-            if title:
-                conversation_titles.append(title)
+            try:
+                title = await run_scripted_steps(page, input_data, trend_index=trend_idx, on_progress=on_progress)
+            except Exception as e:
+                logger.warning("Round %d scripted steps failed: %s, skipping", i+1, e)
+                tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 提交失败，跳过: {e}"
+                await _broadcast(task_id, tasks[task_id].model_dump())
+                continue
+
+            if not title:
+                logger.warning("Round %d returned no title, skipping", i+1)
+                continue
+
+            conversation_titles.append(title)
 
             # Click replies until "正在生成视频" appears
-            tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 点击回复中，等待进入生成状态..."
-            await _broadcast(task_id, tasks[task_id].model_dump())
-            await wait_until_generating(page)
-
-            tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 已进入生成状态"
-            await _broadcast(task_id, tasks[task_id].model_dump())
+            try:
+                tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 点击回复中，等待进入生成状态..."
+                await _broadcast(task_id, tasks[task_id].model_dump())
+                await wait_until_generating(page)
+                tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 已进入生成状态"
+                await _broadcast(task_id, tasks[task_id].model_dump())
+            except Exception as e:
+                logger.warning("Round %d wait_until_generating failed: %s", i+1, e)
+                tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 等待生成超时，继续下一个..."
+                await _broadcast(task_id, tasks[task_id].model_dump())
 
         # All submitted and generating, now wait and download only OUR conversations
         tasks[task_id].message = f"全部已进入生成状态，等待下载（每10分钟检查）..."

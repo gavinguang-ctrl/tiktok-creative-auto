@@ -215,32 +215,41 @@ async def select_category_tab(page: Page, category: str):
     if not category:
         return
 
-    # The industry dropdown is the first ks-select in the modal
-    industry_select = page.locator('#inspiration-modal-container ks-select-1-1-11').first
-    if await industry_select.count() == 0:
-        logger.warning("Industry dropdown not found")
-        return
+    try:
+        industry_select = page.locator('#inspiration-modal-container ks-select-1-1-11').first
+        if await industry_select.count() == 0:
+            logger.warning("Industry dropdown not found, skipping")
+            return
 
-    await industry_select.click()
-    await asyncio.sleep(1)
-
-    # Select the category from dropdown options
-    option = page.locator(f':text-is("{category}")')
-    if await option.count() > 0:
-        await option.first.click()
-        logger.info("Selected industry: %s", category)
+        await industry_select.click()
         await asyncio.sleep(1)
-    else:
-        # Try partial match
-        option2 = page.locator(f':text("{category}")')
-        if await option2.count() > 0:
-            await option2.first.click()
-            logger.info("Selected industry (partial): %s", category)
+
+        # Select the category from dropdown options (use force click, don't rely on visibility)
+        option = page.locator(f':text-is("{category}")')
+        if await option.count() > 0:
+            try:
+                await option.first.click(force=True, timeout=5000)
+            except Exception:
+                await option.first.dispatch_event("click")
+            logger.info("Selected industry: %s", category)
             await asyncio.sleep(1)
         else:
-            logger.warning("Industry '%s' not found in dropdown, pressing Escape", category)
-            await page.keyboard.press("Escape")
-            await asyncio.sleep(0.5)
+            option2 = page.locator(f':text("{category}")')
+            if await option2.count() > 0:
+                try:
+                    await option2.first.click(force=True, timeout=5000)
+                except Exception:
+                    await option2.first.dispatch_event("click")
+                logger.info("Selected industry (partial): %s", category)
+                await asyncio.sleep(1)
+            else:
+                logger.warning("Industry '%s' not found, pressing Escape", category)
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(0.5)
+    except Exception as e:
+        logger.warning("select_category_tab failed: %s, skipping", e)
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(0.5)
 
 
 async def select_trend_item(page: Page, trend_index: int):
@@ -296,15 +305,58 @@ async def click_first_reply(page: Page):
     return False
 
 
+async def _handle_rejection_and_retry(page: Page) -> bool:
+    """Check if video was rejected (AI safety violation). If so, click storyboard option and retry.
+    Returns True if rejection was detected and handled."""
+    # Detect rejection indicators
+    rejection = page.locator(':text("违反"), :text("rejected"), :text("audit"), :text("安全规范")')
+    if await rejection.count() == 0:
+        return False
+
+    logger.warning("Video rejection detected, attempting recovery via storyboard refinement")
+
+    # Click the second reply button (refine storyboard) or one containing "storyboard"
+    reply_btns = page.locator('button.tiktok-bodySm.rounded-full.border')
+    count = await reply_btns.count()
+    if count >= 2:
+        # Prefer button with "storyboard" or "refine" text, otherwise click second
+        for i in range(count):
+            text = (await reply_btns.nth(i).text_content() or "").lower()
+            if "storyboard" in text or "refine" in text:
+                await reply_btns.nth(i).click()
+                logger.info("Clicked storyboard/refine option: %s", text[:50])
+                await asyncio.sleep(5)
+                return True
+        # Fallback: click second button
+        await reply_btns.nth(1).click()
+        logger.info("Clicked second reply option for recovery")
+        await asyncio.sleep(5)
+        return True
+    elif count == 1:
+        await reply_btns.first.click()
+        await asyncio.sleep(5)
+        return True
+
+    return False
+
+
 async def wait_until_generating(page: Page, timeout_s: int = 300):
-    """Keep clicking first reply until '正在生成视频' appears, then return immediately."""
+    """Keep clicking first reply until '正在生成视频' appears.
+    If rejection is detected, handle it and continue retrying."""
     elapsed = 0
     while elapsed < timeout_s:
+        # Check if generation started
         generating = page.locator(':text("正在生成视频")')
         if await generating.count() > 0:
             logger.info("Video generation started")
             return True
 
+        # Check for rejection/error and handle it
+        if await _handle_rejection_and_retry(page):
+            elapsed += 5
+            continue
+
+        # Click first reply button if available
         reply_btn = page.locator('button.tiktok-bodySm.rounded-full.border')
         try:
             if await reply_btn.count() > 0 and await reply_btn.first.is_visible(timeout=2000):
@@ -425,6 +477,23 @@ async def download_all_videos(page: Page, task_id: str, conversation_titles: lis
             # Scroll to bottom to find the video
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await asyncio.sleep(2)
+
+            # Check for rejection - if found, handle it and skip this round (will retry next poll)
+            if await _handle_rejection_and_retry(page):
+                logger.info("Handled rejection in '%s', will retry next poll", matched_title)
+                # Keep clicking replies to push through to generation
+                for _ in range(10):
+                    await asyncio.sleep(5)
+                    generating = page.locator(':text("正在生成视频")')
+                    if await generating.count() > 0:
+                        break
+                    reply_btn = page.locator('button.tiktok-bodySm.rounded-full.border')
+                    try:
+                        if await reply_btn.count() > 0 and await reply_btn.first.is_visible(timeout=2000):
+                            await reply_btn.first.click()
+                    except Exception:
+                        pass
+                continue
 
             # Hover/click on the video to make download button appear
             video_el = page.locator('video, [class*="video-player"], [class*="videoPlayer"], [data-testid*="video"]')
@@ -552,9 +621,14 @@ async def run_scripted_steps(
             await progress("图片上传失败，跳过继续...")
 
     # Step 4: Click '+ TikTok 趋势' then 'Select a trend'
-    await progress("打开趋势选择...")
-    await _retry(lambda: click_tiktok_trend(page), "Click TikTok trend")
-    await _retry(lambda: open_trend_selector(page), "Open trend selector")
+    try:
+        await progress("打开趋势选择...")
+        await _retry(lambda: click_tiktok_trend(page), "Click TikTok trend")
+        await _retry(lambda: open_trend_selector(page), "Open trend selector")
+    except Exception as e:
+        logger.warning("Failed to open trend selector: %s", e)
+        await progress(f"打开趋势选择失败: {e}，跳过此轮...")
+        return ""
 
     # Step 5: Select category (if specified)
     if input_data.category:
@@ -562,16 +636,33 @@ async def run_scripted_steps(
         await select_category_tab(page, input_data.category)
 
     # Step 6: Select trend item
-    await progress(f"选择第 {trend_index + 1} 个趋势...")
-    await _retry(lambda: select_trend_item(page, trend_index), "Select trend item")
+    try:
+        await progress(f"选择第 {trend_index + 1} 个趋势...")
+        await _retry(lambda: select_trend_item(page, trend_index), "Select trend item")
+    except Exception as e:
+        logger.warning("Failed to select trend item: %s", e)
+        await progress(f"选择趋势失败: {e}，跳过此轮...")
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(1)
+        return ""
 
     # Step 7: Confirm
-    await progress("确认趋势选择...")
-    await _retry(lambda: confirm_trend(page), "Confirm trend")
+    try:
+        await progress("确认趋势选择...")
+        await _retry(lambda: confirm_trend(page), "Confirm trend")
+    except Exception as e:
+        logger.warning("Failed to confirm trend: %s", e)
+        await progress(f"确认失败: {e}，跳过此轮...")
+        return ""
 
     # Step 8: Send
-    await progress("发送生成请求...")
-    await _retry(lambda: click_send(page), "Click send")
+    try:
+        await progress("发送生成请求...")
+        await _retry(lambda: click_send(page), "Click send")
+    except Exception as e:
+        logger.warning("Failed to send: %s", e)
+        await progress(f"发送失败: {e}，跳过此轮...")
+        return ""
 
     await progress("等待生成，自动选择回复...")
     await progress("固定步骤完成")

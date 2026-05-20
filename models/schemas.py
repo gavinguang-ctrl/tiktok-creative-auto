@@ -14,6 +14,7 @@ class InputData(BaseModel):
     subtitle_enabled: bool = True
     category: str = ""
     video_count: int = 1
+    start_trend_index: int = 0
     image_paths: list[str] = []
     video_paths: list[str] = []
 
