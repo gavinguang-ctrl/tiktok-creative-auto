@@ -72,12 +72,51 @@ async def fill_prompt(page: Page, prompt: str):
     el = await _find_element(page, "chat_input")
     await el.click()
     await asyncio.sleep(0.3)
-    await el.fill(prompt)
+    # Clear existing content using keyboard (execCommand doesn't work on ProseMirror)
+    await page.keyboard.press("Control+A")
+    await asyncio.sleep(0.2)
+    await page.keyboard.press("Backspace")
+    await asyncio.sleep(0.3)
+    await page.keyboard.press("Control+A")
+    await asyncio.sleep(0.1)
+    await page.keyboard.press("Backspace")
+    await asyncio.sleep(0.3)
+    # Insert new prompt via clipboard paste (fast, works on ProseMirror)
+    await page.evaluate("(text) => navigator.clipboard.writeText(text)", prompt)
+    await page.keyboard.press("Control+V")
+    await asyncio.sleep(0.5)
     logger.info("Prompt filled (%d chars)", len(prompt))
 
 
+async def _clear_all_images(page: Page):
+    """Remove all uploaded image attachments by clicking their close buttons."""
+    # Images appear as 60x60 thumbnail cards with a close button (ks-icon-close-small)
+    # inside a button.absolute.right-1.top-1 parent
+    for attempt in range(20):  # max 20 images
+        close_btns = page.locator('button.absolute.right-1.top-1:has(ks-icon-close-small)')
+        count = await close_btns.count()
+        if count == 0:
+            break
+        try:
+            await close_btns.first.click()
+            await asyncio.sleep(0.3)
+        except Exception:
+            break
+    # Also try clearing any images inside the contenteditable editor (fallback)
+    await page.evaluate("""() => {
+        const editor = document.querySelector('[contenteditable="true"]');
+        if (!editor) return;
+        const imgNodes = editor.querySelectorAll(
+            '[data-type*="image"], [contenteditable="false"]:not(.placeholder), img'
+        );
+        imgNodes.forEach(el => el.remove());
+    }""")
+
+
+
+
 async def paste_images(page: Page, image_paths: list[str]):
-    """Upload images by simulating clipboard paste. Wait for upload, retry on failure."""
+    """Upload images by simulating clipboard paste. If some get stuck, remove them."""
     if not image_paths:
         logger.info("No images to upload, skipping")
         return
@@ -105,42 +144,69 @@ async def paste_images(page: Page, image_paths: list[str]):
         await _paste_single_image(page, img_b64, mime, filename)
         await asyncio.sleep(1.5)
 
-    # Wait for uploads to complete by checking if send button becomes enabled
-    # If send button is disabled/grey, images are still uploading
-    await asyncio.sleep(3)
+    # Wait for uploads to complete (send button becomes enabled)
+    await asyncio.sleep(5)
     for check in range(10):
-        is_disabled = await page.evaluate("""() => {
-            const sendBtn = document.querySelector('ks-icon-arrow-up-small');
-            if (!sendBtn) return true;
-            const btn = sendBtn.closest('ks-icon-button-1-1-11') || sendBtn.closest('button');
-            if (!btn) return true;
-            return btn.hasAttribute('disabled') || btn.getAttribute('aria-disabled') === 'true' ||
-                   btn.classList.contains('disabled') || getComputedStyle(btn).opacity < 0.5 ||
-                   getComputedStyle(btn).pointerEvents === 'none';
-        }""")
-        if not is_disabled:
+        if await _is_send_enabled(page):
             logger.info("All %d images uploaded (send button enabled)", len(images_data))
             return
         logger.info("Send button still disabled, images uploading... (%d/10)", check + 1)
         await asyncio.sleep(3)
 
-    # Timeout - remove stuck images and retry
-    logger.warning("Images stuck uploading, removing and retrying")
-    await page.evaluate("""() => {
-        const editor = document.querySelector('[contenteditable="true"]');
-        if (!editor) return;
-        const imgNodes = editor.querySelectorAll('[data-type*="image"], [contenteditable="false"]:not(.placeholder)');
-        imgNodes.forEach(el => el.remove());
+    # Some images are stuck — remove them one by one until send button is enabled
+    logger.warning("Some images stuck uploading after 35s, removing stuck ones")
+    for _ in range(len(images_data)):
+        await _remove_one_stuck_image(page)
+        await asyncio.sleep(1)
+        if await _is_send_enabled(page):
+            logger.info("Send button enabled after removing stuck images")
+            return
+
+    logger.warning("Send button still disabled after removing images")
+
+
+async def _is_send_enabled(page: Page) -> bool:
+    """Check if the send button is currently enabled."""
+    return not await page.evaluate("""() => {
+        const sendBtn = document.querySelector('ks-icon-arrow-up-small');
+        if (!sendBtn) return true;
+        const btn = sendBtn.closest('ks-icon-button-1-1-11') || sendBtn.closest('button');
+        if (!btn) return true;
+        return btn.hasAttribute('disabled') || btn.getAttribute('aria-disabled') === 'true' ||
+               btn.classList.contains('disabled') || getComputedStyle(btn).opacity < 0.5 ||
+               getComputedStyle(btn).pointerEvents === 'none';
     }""")
-    await asyncio.sleep(2)
 
-    # Retry paste
-    for img_b64, mime, filename in images_data:
-        await _paste_single_image(page, img_b64, mime, filename)
-        await asyncio.sleep(2)
 
-    await asyncio.sleep(5)
-    logger.info("Retried pasting %d images", len(images_data))
+async def _remove_one_stuck_image(page: Page):
+    """Remove one uploading/stuck image. Stuck images have blob: src (not yet uploaded to server)."""
+    removed = await page.evaluate("""() => {
+        const closeBtns = document.querySelectorAll('button.absolute.right-1.top-1');
+        for (let i = closeBtns.length - 1; i >= 0; i--) {
+            const btn = closeBtns[i];
+            const container = btn.closest('[class*="relative"]') || btn.parentElement;
+            if (!container) continue;
+            const img = container.querySelector('img');
+            // Stuck/uploading images have blob: or data: src, completed ones have https:
+            if (img && (img.src.startsWith('blob:') || img.src.startsWith('data:'))) {
+                btn.click();
+                return true;
+            }
+            // Also remove if there's a loading spinner
+            if (container.querySelector('[class*="animate"], [class*="loading"], [class*="progress"]')) {
+                btn.click();
+                return true;
+            }
+        }
+        // Fallback: if no blob/loading found but send still disabled, remove last one
+        if (closeBtns.length > 0) {
+            closeBtns[closeBtns.length - 1].click();
+            return true;
+        }
+        return false;
+    }""")
+    if removed:
+        await asyncio.sleep(0.5)
 
 
 async def _paste_single_image(page: Page, img_b64: str, mime: str, filename: str):
@@ -170,8 +236,25 @@ async def _paste_single_image(page: Page, img_b64: str, mime: str, filename: str
     }""", [img_b64, mime, filename])
 
 
+async def _dismiss_existing_trend(page: Page):
+    """Remove any already-selected trend/template card.
+    The card's × button is the first visible <ks-icon-close> element on the page."""
+    close_icons = page.locator('ks-icon-close')
+    count = await close_icons.count()
+    for i in range(count):
+        try:
+            if await close_icons.nth(i).is_visible(timeout=1000):
+                await close_icons.nth(i).click(force=True)
+                await asyncio.sleep(1)
+                logger.info("Dismissed existing trend/template card")
+                return
+        except Exception:
+            continue
+
+
 async def click_tiktok_trend(page: Page):
     """Click the '+ TikTok 趋势' button to open trend panel."""
+    await _dismiss_existing_trend(page)
     el = await _find_element(page, "tiktok_trend_btn")
     await el.click()
     await asyncio.sleep(1)
@@ -252,10 +335,143 @@ async def select_category_tab(page: Page, category: str):
         await asyncio.sleep(0.5)
 
 
+async def _get_subcategory_sidebar(page: Page):
+    """Get the left sidebar container (flex-shrink-0 flex-col) inside the trend modal."""
+    sidebar = page.locator('#inspiration-modal-container [class*="flex-shrink-0"][class*="flex-col"]')
+    if await sidebar.count() == 0:
+        return None
+    return sidebar.first
+
+
+async def _get_subcategory_items(page: Page):
+    """Get all clickable sub-category items from the left sidebar."""
+    sidebar = await _get_subcategory_sidebar(page)
+    if not sidebar:
+        return page.locator('__nonexistent__'), 0
+    # The scrollable list is the second child (first is the "热门广告趋势" header)
+    scroll_list = sidebar.locator('[class*="overflow-y-auto"]')
+    if await scroll_list.count() == 0:
+        return page.locator('__nonexistent__'), 0
+    # Each item is a div with cursor-pointer class (skip the first "所有趋势" item)
+    items = scroll_list.locator('[class*="cursor-pointer"]')
+    count = await items.count()
+    return items, count
+
+
+async def select_sub_category(page: Page, sub_category: str):
+    """Click sub-category by matching its name text in the left sidebar."""
+    if not sub_category:
+        return
+
+    # Find and click the matching sub-category item via evaluate + click
+    clicked = await page.evaluate("""(targetName) => {
+        const modal = document.querySelector('#inspiration-modal-container');
+        if (!modal) return false;
+        const sidebar = modal.querySelector('[class*="flex-shrink-0"][class*="flex-col"]');
+        if (!sidebar) return false;
+        const scrollList = sidebar.querySelector('[class*="overflow-y-auto"]');
+        if (!scrollList) return false;
+        const items = scrollList.querySelectorAll('[class*="cursor-pointer"]');
+        for (const item of items) {
+            const nameEl = item.querySelector('ks-tooltip-1-1-11 div[class*="truncate"]');
+            if (nameEl) {
+                const text = (nameEl.textContent || '').trim();
+                if (text === targetName) {
+                    item.click();
+                    return true;
+                }
+            }
+        }
+        // Fallback: if targetName is a number, click by index (1-based)
+        if (/^\\d+$/.test(targetName)) {
+            const idx = parseInt(targetName) - 1;
+            // Skip items without ks-tooltip (like "所有趋势" header)
+            let subItems = [];
+            for (const item of items) {
+                if (item.querySelector('ks-tooltip-1-1-11 div[class*="truncate"]')) {
+                    subItems.push(item);
+                }
+            }
+            if (idx >= 0 && idx < subItems.length) {
+                subItems[idx].click();
+                return true;
+            }
+        }
+        return false;
+    }""", sub_category)
+
+    if clicked:
+        await asyncio.sleep(1.5)
+        logger.info("Selected sub-category: %s", sub_category)
+    else:
+        logger.warning("Sub-category '%s' not found in sidebar", sub_category)
+
+
+async def _scrape_sidebar_names(page: Page) -> list[str]:
+    """Read sub-category names from the left sidebar DOM."""
+    return await page.evaluate("""() => {
+        const modal = document.querySelector('#inspiration-modal-container');
+        if (!modal) return [];
+        const sidebar = modal.querySelector('[class*="flex-shrink-0"][class*="flex-col"]');
+        if (!sidebar) return [];
+        const scrollList = sidebar.querySelector('[class*="overflow-y-auto"]');
+        if (!scrollList) return [];
+        const items = scrollList.querySelectorAll('[class*="cursor-pointer"]');
+        const result = [];
+        for (const item of items) {
+            const nameEl = item.querySelector('ks-tooltip-1-1-11 div[class*="truncate"]');
+            if (nameEl) {
+                const text = (nameEl.textContent || '').trim();
+                if (text) {
+                    result.push(text);
+                }
+            }
+        }
+        return result;
+    }""")
+
+
+async def scrape_all_subcategories(page: Page, categories: list[str]) -> dict[str, list[dict]]:
+    """Open trend modal, iterate categories, read sub-category names and translate to Chinese."""
+    from services.translate import translate_batch
+
+    result = {}
+
+    await click_tiktok_trend(page)
+    await open_trend_selector(page)
+    await asyncio.sleep(2)
+
+    # First: scrape default sub-categories (no industry selected, limit 20)
+    default_names = (await _scrape_sidebar_names(page))[:20]
+    if default_names:
+        zh_names = translate_batch(default_names)
+        result[""] = [{"en": en, "zh": zh} for en, zh in zip(default_names, zh_names)]
+        logger.info("Default (no industry): found %d sub-categories", len(default_names))
+
+    # Then: scrape each industry
+    for category in categories:
+        await select_category_tab(page, category)
+        await asyncio.sleep(2)
+
+        names = await _scrape_sidebar_names(page)
+        zh_names = translate_batch(names)
+        result[category] = [{"en": en, "zh": zh} for en, zh in zip(names, zh_names)]
+        logger.info("Category '%s': found %d sub-categories", category, len(names))
+
+    await page.keyboard.press("Escape")
+    await asyncio.sleep(1)
+    return result
+
+
 async def select_trend_item(page: Page, trend_index: int):
     """Select the nth trend item (radio button) in the modal."""
+    # Try primary selector
     trend_radios = page.locator('#inspiration-modal-scroll-container ks-radio-1-1-11')
     count = await trend_radios.count()
+    # Fallback: try broader selector if primary finds nothing
+    if count == 0:
+        trend_radios = page.locator('#inspiration-modal-container ks-radio-1-1-11')
+        count = await trend_radios.count()
     if count == 0:
         raise RuntimeError("No trend items found in modal")
     actual_index = trend_index % count
@@ -305,45 +521,64 @@ async def click_first_reply(page: Page):
     return False
 
 
-async def _handle_rejection_and_retry(page: Page) -> bool:
-    """Check if video was rejected (AI safety violation). If so, click storyboard option and retry.
+async def _handle_rejection_and_retry(page: Page, rejection_count: int = 0) -> bool:
+    """Check if video was rejected (AI safety violation). If so, handle recovery.
+    First rejection: click storyboard/refine option.
+    Subsequent rejections: click generate video option (not storyboard again).
     Returns True if rejection was detected and handled."""
     # Detect rejection indicators
     rejection = page.locator(':text("违反"), :text("rejected"), :text("audit"), :text("安全规范")')
     if await rejection.count() == 0:
         return False
 
-    logger.warning("Video rejection detected, attempting recovery via storyboard refinement")
+    logger.warning("Video rejection detected (count=%d), attempting recovery", rejection_count)
 
-    # Click the second reply button (refine storyboard) or one containing "storyboard"
     reply_btns = page.locator('button.tiktok-bodySm.rounded-full.border')
     count = await reply_btns.count()
-    if count >= 2:
-        # Prefer button with "storyboard" or "refine" text, otherwise click second
+    if count == 0:
+        return False
+
+    if rejection_count == 0:
+        # First rejection: choose storyboard/refine (usually second button)
+        if count >= 2:
+            for i in range(count):
+                text = (await reply_btns.nth(i).text_content() or "").lower()
+                if "storyboard" in text or "refine" in text or "rewrite" in text:
+                    await reply_btns.nth(i).click()
+                    logger.info("First rejection: clicked refine option: %s", text[:50])
+                    await asyncio.sleep(5)
+                    return True
+            await reply_btns.nth(1).click()
+            logger.info("First rejection: clicked second button")
+            await asyncio.sleep(5)
+            return True
+        else:
+            await reply_btns.first.click()
+            await asyncio.sleep(5)
+            return True
+    else:
+        # Subsequent rejections: choose generate video (usually first button)
         for i in range(count):
             text = (await reply_btns.nth(i).text_content() or "").lower()
-            if "storyboard" in text or "refine" in text:
+            if "generate" in text or "video" in text or "生成" in text:
                 await reply_btns.nth(i).click()
-                logger.info("Clicked storyboard/refine option: %s", text[:50])
+                logger.info("Subsequent rejection: clicked generate option: %s", text[:50])
                 await asyncio.sleep(5)
                 return True
-        # Fallback: click second button
-        await reply_btns.nth(1).click()
-        logger.info("Clicked second reply option for recovery")
-        await asyncio.sleep(5)
-        return True
-    elif count == 1:
+        # Fallback: click first button (generate video is typically first)
         await reply_btns.first.click()
+        logger.info("Subsequent rejection: clicked first button")
         await asyncio.sleep(5)
         return True
 
-    return False
 
-
-async def wait_until_generating(page: Page, timeout_s: int = 300):
+async def wait_until_generating(page: Page, timeout_s: int = 300, stuck_threshold_s: int = 180):
     """Keep clicking first reply until '正在生成视频' appears.
-    If rejection is detected, handle it and continue retrying."""
+    If rejection is detected, handle it and continue retrying.
+    Returns False if stuck for stuck_threshold_s without any progress."""
     elapsed = 0
+    last_action_at = 0
+    rejection_count = 0
     while elapsed < timeout_s:
         # Check if generation started
         generating = page.locator(':text("正在生成视频")')
@@ -352,7 +587,9 @@ async def wait_until_generating(page: Page, timeout_s: int = 300):
             return True
 
         # Check for rejection/error and handle it
-        if await _handle_rejection_and_retry(page):
+        if await _handle_rejection_and_retry(page, rejection_count):
+            rejection_count += 1
+            last_action_at = elapsed
             elapsed += 5
             continue
 
@@ -362,6 +599,7 @@ async def wait_until_generating(page: Page, timeout_s: int = 300):
             if await reply_btn.count() > 0 and await reply_btn.first.is_visible(timeout=2000):
                 await reply_btn.first.click()
                 logger.info("Clicked reply button")
+                last_action_at = elapsed
                 await asyncio.sleep(5)
                 elapsed += 5
             else:
@@ -370,6 +608,11 @@ async def wait_until_generating(page: Page, timeout_s: int = 300):
         except Exception:
             await asyncio.sleep(5)
             elapsed += 5
+
+        # Stuck detection
+        if elapsed - last_action_at >= stuck_threshold_s:
+            logger.warning("Stuck for %ds without progress, aborting", stuck_threshold_s)
+            return False
 
     logger.warning("Timeout waiting for generation after %ds", timeout_s)
     return False
@@ -595,30 +838,37 @@ async def run_scripted_steps(
     await page.wait_for_load_state("domcontentloaded")
     await asyncio.sleep(2)
 
-    # Step 1: If on /chat page, click new chat. If on /create page, skip (already fresh)
-    if "/chat" in page.url or trend_index > 0:
+    # Step 1: Always start a fresh conversation to avoid leftover content
+    # Only skip if we're on a brand new /create page with no existing content
+    needs_new_chat = True
+    if trend_index == 0 and "/create" in page.url:
+        # Check if the editor is empty (no leftover content)
+        editor = page.locator('[contenteditable="true"]')
+        if await editor.count() > 0:
+            content = (await editor.first.text_content() or "").strip()
+            if not content:
+                needs_new_chat = False
+
+    if needs_new_chat:
         await progress("开启新对话...")
         await _retry(lambda: click_new_chat(page), "New chat")
+        # Ensure editor is completely clean after new chat
+        await _clear_all_images(page)
 
-    # Step 2: Fill prompt
+    # Step 2: Fill prompt (clears any existing text via Ctrl+A + Delete)
     await progress("填入提示词...")
-    prompt = render_prompt(input_data)
+    prompt = input_data.custom_prompt if input_data.custom_prompt.strip() else render_prompt(input_data)
     await _retry(lambda: fill_prompt(page, prompt), "Fill prompt")
 
-    # Step 3: Paste images into input box (non-blocking, skip on failure)
+    # Step 3: Paste images — stuck ones get removed automatically
     if input_data.image_paths:
         await progress("上传图片到输入框...")
         try:
-            await asyncio.wait_for(
-                paste_images(page, input_data.image_paths),
-                timeout=30.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("Image upload timed out after 30s, skipping")
-            await progress("图片上传超时，跳过继续...")
+            await paste_images(page, input_data.image_paths)
         except Exception as e:
-            logger.warning("Image upload failed: %s, skipping", e)
-            await progress("图片上传失败，跳过继续...")
+            logger.warning("Image upload failed: %s, continuing without images", e)
+            await progress("图片上传失败，继续...")
+        await progress("图片处理完成")
 
     # Step 4: Click '+ TikTok 趋势' then 'Select a trend'
     try:
@@ -634,6 +884,11 @@ async def run_scripted_steps(
     if input_data.category:
         await progress(f"选择类目: {input_data.category}")
         await select_category_tab(page, input_data.category)
+
+    # Step 5.5: Select sub-category (if specified)
+    if input_data.sub_category:
+        await progress(f"选择子分类: {input_data.sub_category}")
+        await select_sub_category(page, input_data.sub_category)
 
     # Step 6: Select trend item
     try:

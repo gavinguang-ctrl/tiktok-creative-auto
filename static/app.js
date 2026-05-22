@@ -1,12 +1,26 @@
 let uploadedImagePaths = [];
 let uploadedVideoPaths = [];
+let currentTaskId = null;
+let subcategoryData = {};
 
 document.addEventListener("DOMContentLoaded", () => {
   renderHistory();
+  loadSubcategories();
 
   document.getElementById("mainForm").addEventListener("submit", async (e) => {
     e.preventDefault();
     await previewPrompt();
+  });
+
+  document.getElementById("category").addEventListener("change", () => {
+    updateSubCategoryOptions();
+  });
+
+  document.getElementById("subCategory").addEventListener("change", () => {
+    const sel = document.getElementById("subCategory");
+    const hint = document.getElementById("subCategoryEnHint");
+    const opt = sel.options[sel.selectedIndex];
+    hint.textContent = opt && opt.getAttribute("data-en") ? opt.getAttribute("data-en") : "";
   });
 
   document.getElementById("imageFiles").addEventListener("change", (e) => {
@@ -16,6 +30,63 @@ document.addEventListener("DOMContentLoaded", () => {
     showFileList("videoList", e.target.files);
   });
 });
+
+async function loadSubcategories() {
+  try {
+    const resp = await fetch("/api/subcategories");
+    subcategoryData = await resp.json();
+    updateSubCategoryOptions();
+  } catch (e) {
+    subcategoryData = {};
+  }
+}
+
+function updateSubCategoryOptions() {
+  const category = document.getElementById("category").value;
+  const group = document.getElementById("subCategoryGroup");
+  const select = document.getElementById("subCategory");
+
+  // Show sub-categories for selected category, or default ("") if none selected
+  const subs = subcategoryData[category] || subcategoryData[""] || [];
+  if (subs.length === 0) {
+    group.style.display = "none";
+    select.innerHTML = '<option value="">-- 所有趋势 --</option>';
+    return;
+  }
+
+  group.style.display = "";
+  select.innerHTML = '<option value="">-- 所有趋势 --</option>';
+  for (const sub of subs) {
+    const opt = document.createElement("option");
+    if (typeof sub === "object" && sub.en) {
+      opt.value = sub.en;
+      opt.textContent = sub.zh;
+      opt.setAttribute("data-en", sub.en);
+    } else {
+      opt.value = sub;
+      opt.textContent = sub;
+    }
+    select.appendChild(opt);
+  }
+}
+
+async function refreshSubcategories() {
+  const hint = document.getElementById("subCategoryHint");
+  hint.textContent = "正在抓取子分类...";
+  try {
+    const resp = await fetch("/api/scrape-subcategories", { method: "POST" });
+    if (!resp.ok) {
+      const err = await resp.json();
+      hint.textContent = "抓取失败: " + (err.error || resp.statusText);
+      return;
+    }
+    subcategoryData = await resp.json();
+    hint.textContent = "更新完成";
+    updateSubCategoryOptions();
+  } catch (e) {
+    hint.textContent = "抓取失败: " + e.message;
+  }
+}
 
 // --- History Management (localStorage) ---
 
@@ -40,6 +111,7 @@ function saveCurrentToHistory() {
     language: document.getElementById("language").value,
     subtitleEnabled: document.getElementById("subtitleEnabled").checked,
     category: document.getElementById("category").value,
+    subCategory: document.getElementById("subCategory").value,
     videoCount: document.getElementById("videoCount").value,
     startTrendIndex: document.getElementById("startTrendIndex").value,
     imagePaths: uploadedImagePaths,
@@ -65,6 +137,8 @@ function loadFromHistory(id) {
   document.getElementById("language").value = task.language || "越南语";
   document.getElementById("subtitleEnabled").checked = task.subtitleEnabled !== false;
   document.getElementById("category").value = task.category || "";
+  updateSubCategoryOptions();
+  document.getElementById("subCategory").value = task.subCategory || "";
   document.getElementById("videoCount").value = task.videoCount || "1";
   document.getElementById("startTrendIndex").value = task.startTrendIndex || "0";
 
@@ -187,10 +261,12 @@ async function confirmAndRun() {
   form.append("language", document.getElementById("language").value);
   form.append("subtitle_enabled", document.getElementById("subtitleEnabled").checked);
   form.append("category", document.getElementById("category").value);
+  form.append("sub_category", document.getElementById("subCategory").value);
   form.append("video_count", document.getElementById("videoCount").value);
   form.append("start_trend_index", document.getElementById("startTrendIndex").value);
   form.append("image_paths", uploadedImagePaths.join(","));
   form.append("video_paths", uploadedVideoPaths.join(","));
+  form.append("custom_prompt", document.getElementById("generatedPrompt").value);
 
   statusMsg.textContent = "启动任务...";
   const resp = await fetch("/api/run", { method: "POST", body: form });
@@ -201,6 +277,8 @@ async function confirmAndRun() {
     return;
   }
 
+  currentTaskId = data.task_id;
+  document.getElementById("stopTaskBtn").style.display = "";
   connectWebSocket(data.task_id);
 }
 
@@ -230,10 +308,12 @@ function connectWebSocket(taskId) {
     if (data.status === "completed") {
       progressFill.style.width = "100%";
       loopStatus.textContent = `全部完成 (${data.result_paths.length} 个视频)`;
+      document.getElementById("stopTaskBtn").style.display = "none";
       ws.close();
     } else if (data.status === "failed") {
       progressFill.style.width = "100%";
       progressFill.style.background = "#cc3333";
+      document.getElementById("stopTaskBtn").style.display = "none";
       ws.close();
     }
   };
@@ -270,4 +350,18 @@ async function pollStatus(taskId) {
       progressFill.style.width = "100%";
     }
   }, 3000);
+}
+
+async function stopTask() {
+  if (!currentTaskId) return;
+  try {
+    await fetch(`/api/run/${currentTaskId}/stop`, { method: "POST" });
+  } catch (e) {
+    console.error("Stop request failed:", e);
+  }
+  // Reset UI back to form
+  document.getElementById("statusPanel").classList.add("hidden");
+  document.getElementById("mainForm").classList.remove("hidden");
+  document.getElementById("stopTaskBtn").style.display = "";
+  currentTaskId = null;
 }

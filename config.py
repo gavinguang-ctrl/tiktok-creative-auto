@@ -5,6 +5,8 @@ from pathlib import Path
 BASE_DIR = Path(__file__).parent
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 UPLOADS_DIR = BASE_DIR / "uploads"
+DATA_DIR = BASE_DIR / "data"
+SUBCATEGORIES_FILE = DATA_DIR / "subcategories.json"
 
 CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 CDP_PORT = 9222

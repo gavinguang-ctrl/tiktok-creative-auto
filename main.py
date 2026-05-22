@@ -14,9 +14,9 @@ from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconn
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 
-from config import BASE_DIR, UPLOADS_DIR, DOWNLOADS_DIR, DEFAULT_CATEGORIES
+from config import BASE_DIR, UPLOADS_DIR, DOWNLOADS_DIR, DEFAULT_CATEGORIES, DATA_DIR, SUBCATEGORIES_FILE
 from browser.manager import browser_manager
-from browser.scripted_steps import run_scripted_steps, wait_until_generating, download_all_videos
+from browser.scripted_steps import run_scripted_steps, wait_until_generating, download_all_videos, scrape_all_subcategories
 from models.schemas import InputData, TaskStatus
 from services.template import render_prompt
 
@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 UPLOADS_DIR.mkdir(exist_ok=True)
 DOWNLOADS_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(exist_ok=True)
 
 tasks: dict[str, TaskStatus] = {}
 ws_connections: dict[str, list[WebSocket]] = {}
@@ -32,6 +33,9 @@ ws_connections: dict[str, list[WebSocket]] = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Verify event loop supports subprocess (required by Playwright)
+    loop = asyncio.get_running_loop()
+    logger.info("Event loop type: %s", type(loop).__name__)
     yield
     await browser_manager.close()
 
@@ -60,6 +64,31 @@ async def upload_files(files: list[UploadFile] = File(...)):
 @app.get("/api/categories")
 async def get_categories():
     return {"categories": DEFAULT_CATEGORIES}
+
+
+@app.get("/api/subcategories")
+async def get_subcategories():
+    """Return cached subcategories data."""
+    import json
+    if SUBCATEGORIES_FILE.exists():
+        return json.loads(SUBCATEGORIES_FILE.read_text(encoding="utf-8"))
+    return {}
+
+
+@app.post("/api/scrape-subcategories")
+async def scrape_subcategories_api():
+    """Scrape sub-categories from TikTok trend modal for all industries."""
+    import json
+    try:
+        page = await browser_manager.open_tiktok()
+        result = await scrape_all_subcategories(page, DEFAULT_CATEGORIES)
+        SUBCATEGORIES_FILE.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        return result
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        logger.exception("Scrape subcategories failed")
+        return JSONResponse({"error": f"{type(e).__name__}: {e}", "traceback": tb}, status_code=500)
 
 
 @app.post("/api/preview-prompt")
@@ -97,10 +126,12 @@ async def run_workflow(
     language: str = Form(""),
     subtitle_enabled: bool = Form(True),
     category: str = Form(""),
+    sub_category: str = Form(""),
     video_count: int = Form(1),
     start_trend_index: int = Form(0),
     image_paths: str = Form(""),
     video_paths: str = Form(""),
+    custom_prompt: str = Form(""),
 ):
     task_id = uuid.uuid4().hex[:8]
     input_data = InputData(
@@ -113,10 +144,12 @@ async def run_workflow(
         language=language,
         subtitle_enabled=subtitle_enabled,
         category=category,
+        sub_category=sub_category,
         video_count=max(1, min(video_count, 20)),
         start_trend_index=max(0, start_trend_index),
         image_paths=[p.strip() for p in image_paths.split(",") if p.strip()],
         video_paths=[p.strip() for p in video_paths.split(",") if p.strip()],
+        custom_prompt=custom_prompt,
     )
 
     tasks[task_id] = TaskStatus(
@@ -137,43 +170,66 @@ async def _run_task(task_id: str, input_data: InputData):
 
         # For each video: complete the full flow until "正在生成视频" before moving to next
         for i in range(input_data.video_count):
+            if tasks[task_id].status == "stopped":
+                logger.info("Task %s stopped by user", task_id)
+                break
+
             trend_idx = input_data.start_trend_index + i
-            tasks[task_id].current_video = i + 1
-            tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 提交中..."
-            await _broadcast(task_id, tasks[task_id].model_dump())
+            retry_count = 0
+            max_retries = 2
+            success = False
 
-            async def on_progress(msg: str):
-                tasks[task_id].message = f"[{i+1}/{input_data.video_count}] {msg}"
+            while retry_count <= max_retries and not success:
+                if tasks[task_id].status == "stopped":
+                    break
+                tasks[task_id].current_video = i + 1
+                attempt_msg = f" (重试{retry_count})" if retry_count > 0 else ""
+                tasks[task_id].message = f"[{i+1}/{input_data.video_count}]{attempt_msg} 提交中..."
                 await _broadcast(task_id, tasks[task_id].model_dump())
 
-            # Fill prompt, upload images, select trend, send
-            try:
-                title = await run_scripted_steps(page, input_data, trend_index=trend_idx, on_progress=on_progress)
-            except Exception as e:
-                logger.warning("Round %d scripted steps failed: %s, skipping", i+1, e)
-                tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 提交失败，跳过: {e}"
-                await _broadcast(task_id, tasks[task_id].model_dump())
-                continue
+                async def on_progress(msg: str):
+                    tasks[task_id].message = f"[{i+1}/{input_data.video_count}]{attempt_msg} {msg}"
+                    await _broadcast(task_id, tasks[task_id].model_dump())
 
-            if not title:
-                logger.warning("Round %d returned no title, skipping", i+1)
-                continue
+                # Fill prompt, upload images, select trend, send
+                try:
+                    title = await run_scripted_steps(page, input_data, trend_index=trend_idx, on_progress=on_progress)
+                except Exception as e:
+                    logger.warning("Round %d attempt %d scripted steps failed: %s", i+1, retry_count+1, e)
+                    retry_count += 1
+                    continue
 
-            conversation_titles.append(title)
+                if not title:
+                    logger.warning("Round %d attempt %d returned no title", i+1, retry_count+1)
+                    retry_count += 1
+                    continue
 
-            # Click replies until "正在生成视频" appears
-            try:
-                tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 点击回复中，等待进入生成状态..."
-                await _broadcast(task_id, tasks[task_id].model_dump())
-                await wait_until_generating(page)
-                tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 已进入生成状态"
-                await _broadcast(task_id, tasks[task_id].model_dump())
-            except Exception as e:
-                logger.warning("Round %d wait_until_generating failed: %s", i+1, e)
-                tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 等待生成超时，继续下一个..."
+                # Click replies until "正在生成视频" appears
+                try:
+                    tasks[task_id].message = f"[{i+1}/{input_data.video_count}]{attempt_msg} 点击回复中，等待进入生成状态..."
+                    await _broadcast(task_id, tasks[task_id].model_dump())
+                    generating = await wait_until_generating(page)
+                    if generating:
+                        conversation_titles.append(title)
+                        tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 已进入生成状态"
+                        await _broadcast(task_id, tasks[task_id].model_dump())
+                        success = True
+                    else:
+                        logger.warning("Round %d attempt %d: stuck waiting for generation", i+1, retry_count+1)
+                        retry_count += 1
+                except Exception as e:
+                    logger.warning("Round %d attempt %d wait_until_generating failed: %s", i+1, retry_count+1, e)
+                    retry_count += 1
+
+            if not success:
+                logger.warning("Round %d failed after %d retries, skipping", i+1, max_retries)
+                tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 重试{max_retries}次仍失败，跳过"
                 await _broadcast(task_id, tasks[task_id].model_dump())
 
         # All submitted and generating, now wait and download only OUR conversations
+        if tasks[task_id].status == "stopped":
+            return
+
         tasks[task_id].message = f"全部已进入生成状态，等待下载（每10分钟检查）..."
         await _broadcast(task_id, tasks[task_id].model_dump())
         logger.info("Tracking conversations: %s", conversation_titles)
@@ -201,6 +257,17 @@ async def task_status(task_id: str):
     if task_id not in tasks:
         return JSONResponse({"error": "Not found"}, status_code=404)
     return tasks[task_id].model_dump()
+
+
+@app.post("/api/run/{task_id}/stop")
+async def stop_task(task_id: str):
+    t = tasks.get(task_id)
+    if not t:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    t.status = "stopped"
+    t.message = "用户终止任务"
+    await _broadcast(task_id, t.model_dump())
+    return {"status": "stopped"}
 
 
 @app.get("/api/run/{task_id}/results")

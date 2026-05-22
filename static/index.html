@@ -60,6 +60,17 @@
                     <option value="运动与户外活动">运动与户外活动</option>
                     <option value="应用">应用</option>
                 </select>
+                <button type="button" class="btn-small" onclick="refreshSubcategories()" style="margin-top:4px">🔄 更新子分类数据</button>
+                <span class="hint" id="subCategoryHint"></span>
+            </div>
+
+            <div class="form-group" id="subCategoryGroup" style="display:none">
+                <label>趋势子分类</label>
+                <select id="subCategory">
+                    <option value="">-- 所有趋势 --</option>
+                </select>
+                <span class="hint" id="subCategoryEnHint"></span>
+                <span class="hint">遇类似的子分类，优先选靠前的</span>
             </div>
 
             <div class="form-group">
@@ -149,8 +160,8 @@
         </form>
 
         <div id="promptPreview" class="prompt-preview hidden">
-            <h3>生成的提示词</h3>
-            <textarea id="generatedPrompt" readonly rows="10"></textarea>
+            <h3>生成的提示词 <small style="font-weight:normal;color:#666">（可直接编辑）</small></h3>
+            <textarea id="generatedPrompt" rows="10"></textarea>
             <div class="btn-group">
                 <button type="button" class="btn-primary" onclick="confirmAndRun()">确认并执行</button>
                 <button type="button" class="btn-secondary" onclick="hidePreview()">返回修改</button>
@@ -163,6 +174,9 @@
             <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
             <p id="statusMessage">等待中...</p>
             <div id="resultsList" class="results-list"></div>
+            <div class="btn-group" style="margin-top:12px">
+                <button type="button" class="btn-secondary" id="stopTaskBtn" onclick="stopTask()">终止任务</button>
+            </div>
         </div>
     </div>
 
@@ -174,6 +188,6 @@
         arrow.textContent = content.classList.contains('hidden') ? '▼' : '▲';
     }
     </script>
-    <script src="/static/app.js?v=6"></script>
+    <script src="/static/app.js?v=12"></script>
 </body>
 </html>

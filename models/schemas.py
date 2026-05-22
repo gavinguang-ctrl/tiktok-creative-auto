@@ -13,10 +13,12 @@ class InputData(BaseModel):
     language: str = ""
     subtitle_enabled: bool = True
     category: str = ""
+    sub_category: str = ""
     video_count: int = 1
     start_trend_index: int = 0
     image_paths: list[str] = []
     video_paths: list[str] = []
+    custom_prompt: str = ""
 
 
 class TaskStatus(BaseModel):
