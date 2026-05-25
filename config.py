@@ -13,6 +13,7 @@ CDP_PORT = 9222
 CDP_URL = f"http://localhost:{CDP_PORT}"
 
 TIKTOK_CREATIVE_URL = "https://ads.tiktok.com/creative/creativestudio/chat"
+HISTORY_URL = "https://ads.tiktok.com/creative/creativestudio/create/history"
 
 STEP_RETRY_COUNT = 3
 STEP_RETRY_DELAYS = [1.0, 3.0, 5.0]

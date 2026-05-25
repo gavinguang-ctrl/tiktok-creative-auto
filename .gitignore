@@ -20,3 +20,9 @@ python/
 # OS
 Thumbs.db
 .DS_Store
+
+# Debug artifacts
+debug*.png
+debug*.txt
+*.html
+data/

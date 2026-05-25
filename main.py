@@ -163,10 +163,12 @@ async def run_workflow(
 
 
 async def _run_task(task_id: str, input_data: InputData):
+    from datetime import datetime
     tasks[task_id].status = "running"
+    task_started_at = datetime.now()
     try:
         page = await browser_manager.open_tiktok()
-        conversation_titles = []
+        successful_submissions = 0
 
         # For each video: complete the full flow until "正在生成视频" before moving to next
         for i in range(input_data.video_count):
@@ -210,7 +212,7 @@ async def _run_task(task_id: str, input_data: InputData):
                     await _broadcast(task_id, tasks[task_id].model_dump())
                     generating = await wait_until_generating(page)
                     if generating:
-                        conversation_titles.append(title)
+                        successful_submissions += 1
                         tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 已进入生成状态"
                         await _broadcast(task_id, tasks[task_id].model_dump())
                         success = True
@@ -226,19 +228,28 @@ async def _run_task(task_id: str, input_data: InputData):
                 tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 重试{max_retries}次仍失败，跳过"
                 await _broadcast(task_id, tasks[task_id].model_dump())
 
-        # All submitted and generating, now wait and download only OUR conversations
+        # All submitted and generating, now navigate to history page and download
         if tasks[task_id].status == "stopped":
             return
 
-        tasks[task_id].message = f"全部已进入生成状态，等待下载（每10分钟检查）..."
+        if successful_submissions == 0:
+            tasks[task_id].status = "failed"
+            tasks[task_id].message = "所有提交都失败，无任务可下载"
+            await _broadcast(task_id, tasks[task_id].model_dump())
+            return
+
+        tasks[task_id].message = f"全部已提交（成功 {successful_submissions}），切换到历史页等待下载..."
         await _broadcast(task_id, tasks[task_id].model_dump())
-        logger.info("Tracking conversations: %s", conversation_titles)
+        logger.info("Task %s: %d successful submissions, started at %s", task_id, successful_submissions, task_started_at)
 
         async def on_download_progress(msg: str):
             tasks[task_id].message = msg
             await _broadcast(task_id, tasks[task_id].model_dump())
 
-        results = await download_all_videos(page, task_id, conversation_titles, on_progress=on_download_progress)
+        results = await download_all_videos(
+            page, task_id, task_started_at, successful_submissions,
+            on_progress=on_download_progress,
+        )
         tasks[task_id].result_paths = results
 
         tasks[task_id].status = "completed"

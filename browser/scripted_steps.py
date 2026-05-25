@@ -670,116 +670,240 @@ async def poll_and_advance_conversations(page: Page, conversation_count: int, on
     logger.info("All %d/%d conversations generating", len(generating_set), conversation_count)
 
 
-async def download_all_videos(page: Page, task_id: str, conversation_titles: list[str], on_progress=None):
-    """Poll history conversations every 10 minutes, find OUR generated videos and download them.
+async def download_all_videos(
+    page: Page,
+    task_id: str,
+    task_started_at,
+    expected_count: int,
+    on_progress=None,
+):
+    """Poll the history page every 3 minutes, download videos created after task_started_at.
 
-    Only downloads from conversations whose titles match the ones we created.
+    Identifies "our" tasks by card creation timestamp (UTC, encoded in card name).
+    Handles failed tasks: clicks 三点 → 在聊天中查找 → 点击回复 to retry once.
     """
-    from config import DOWNLOADS_DIR
-    DOWNLOADS_DIR.mkdir(exist_ok=True)
-    results = []
-    downloaded_titles = set()
-    total = len(conversation_titles)
+    from config import DOWNLOADS_DIR, HISTORY_URL
+    from datetime import datetime, timedelta
 
-    max_wait = 5400  # 90 minutes total max
-    poll_interval = 600  # 10 minutes between polls
+    DOWNLOADS_DIR.mkdir(exist_ok=True)
+    results: list[str] = []
+    downloaded_ids: set[str] = set()
+    permanently_failed_ids: set[str] = set()
+    retried_ids: set[str] = set()
+
+    # Window: cards whose name timestamp >= task_started_at - 60s buffer (UTC)
+    window_start_utc = (task_started_at.astimezone() - timedelta(seconds=60)).utctimetuple()
+    window_start_str = "{:04d}{:02d}{:02d}{:02d}{:02d}{:02d}".format(
+        window_start_utc.tm_year, window_start_utc.tm_mon, window_start_utc.tm_mday,
+        window_start_utc.tm_hour, window_start_utc.tm_min, window_start_utc.tm_sec,
+    )
+    logger.info("Download window starts (UTC): %s, expected count: %d", window_start_str, expected_count)
+
+    poll_interval = 180  # 3 minutes
+    max_wait = 5400      # 90 minutes
     elapsed = 0
 
-    while elapsed < max_wait and len(downloaded_titles) < total:
+    await page.goto(HISTORY_URL, wait_until="domcontentloaded", timeout=30000)
+    await asyncio.sleep(8)
+
+    while elapsed < max_wait:
+        completed = len(downloaded_ids) + len(permanently_failed_ids)
+        if completed >= expected_count:
+            break
+
         if on_progress:
-            await on_progress(f"轮询下载中: {len(results)}/{total} 已完成")
+            await on_progress(
+                f"轮询下载: 已完成 {len(downloaded_ids)}/{expected_count}, 失败 {len(permanently_failed_ids)}"
+            )
 
-        # Get sidebar conversation items
-        sidebar_items = page.locator('div.cursor-pointer.items-center.gap-4')
-        count = await sidebar_items.count()
+        # Reload to get latest status
+        try:
+            await page.reload(wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            logger.warning("Reload failed: %s", e)
+        await asyncio.sleep(8)
 
-        for i in range(count):
-            # Get this item's title
-            try:
-                item_text = (await sidebar_items.nth(i).text_content() or "").strip()
-            except Exception:
+        # Extract our cards via JS (sidebar tab may render at 0x0 in background, but DOM still works)
+        cards_info = await page.evaluate("""(windowStart) => {
+            const out = [];
+            const cards = document.querySelectorAll('div.cursor-pointer.items-center.gap-4');
+            for (const c of cards) {
+                const txt = (c.innerText || '').trim();
+                const m = txt.match(/Creative agent_(\\d{14})/);
+                if (!m) continue;
+                if (m[1] < windowStart) continue;  // older than our task window
+                out.push({ id: m[1], text: txt.substring(0, 200) });
+            }
+            return out;
+        }""", window_start_str)
+
+        logger.info("Found %d cards in window", len(cards_info))
+
+        for card_info in cards_info:
+            card_id = card_info["id"]
+            if card_id in downloaded_ids or card_id in permanently_failed_ids:
                 continue
 
-            # Check if this conversation matches one of ours (partial match)
-            matched_title = None
-            for title in conversation_titles:
-                if title and title in item_text and title not in downloaded_titles:
-                    matched_title = title
-                    break
+            # Click the card via JS (avoids visibility issues from background tab)
+            clicked = await page.evaluate("""(cardId) => {
+                const cards = document.querySelectorAll('div.cursor-pointer.items-center.gap-4');
+                for (const c of cards) {
+                    const txt = c.innerText || '';
+                    if (txt.includes('Creative agent_' + cardId)) {
+                        c.scrollIntoView({block: 'center'});
+                        c.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""", card_id)
 
-            if not matched_title:
+            if not clicked:
                 continue
+            await asyncio.sleep(3)
 
-            # Click this conversation
-            try:
-                await sidebar_items.nth(i).click()
-                await asyncio.sleep(3)
-            except Exception:
-                continue
+            # Detect status from detail panel
+            status = await page.evaluate("""() => {
+                const all = document.querySelectorAll('*');
+                for (const el of all) {
+                    const txt = (el.innerText || '').trim();
+                    if (el.children.length === 0) {
+                        if (txt === '已导出') return 'exported';
+                        if (txt === '失败') return 'failed';
+                        if (txt === '生成中') return 'generating';
+                    }
+                }
+                return 'unknown';
+            }""")
 
-            # Scroll to bottom to find the video
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await asyncio.sleep(2)
+            logger.info("Card %s status: %s", card_id, status)
 
-            # Check for rejection - if found, handle it and skip this round (will retry next poll)
-            if await _handle_rejection_and_retry(page):
-                logger.info("Handled rejection in '%s', will retry next poll", matched_title)
-                # Keep clicking replies to push through to generation
-                for _ in range(10):
-                    await asyncio.sleep(5)
-                    generating = page.locator(':text("正在生成视频")')
-                    if await generating.count() > 0:
-                        break
-                    reply_btn = page.locator('button.tiktok-bodySm.rounded-full.border')
-                    try:
-                        if await reply_btn.count() > 0 and await reply_btn.first.is_visible(timeout=2000):
-                            await reply_btn.first.click()
-                    except Exception:
-                        pass
-                continue
-
-            # Hover/click on the video to make download button appear
-            video_el = page.locator('video, [class*="video-player"], [class*="videoPlayer"], [data-testid*="video"]')
-            try:
-                if await video_el.count() > 0 and await video_el.last.is_visible(timeout=3000):
-                    await video_el.last.hover()
-                    await asyncio.sleep(1)
-                    await video_el.last.click()
-                    await asyncio.sleep(1)
-            except Exception:
-                pass
-
-            # Look for download button
-            download_btn = page.locator(':text("下载"), button[aria-label*="下载"], button[aria-label*="download"], a[download]')
-            try:
-                if await download_btn.count() > 0 and await download_btn.first.is_visible(timeout=3000):
-                    save_path = str(DOWNLOADS_DIR / f"{task_id}_{len(results)+1}.mp4")
-                    try:
+            if status == "exported":
+                # Find and click download button
+                save_path = str(DOWNLOADS_DIR / f"{task_id}_{len(results)+1}.mp4")
+                download_btn = page.locator('button:has-text("下载")').filter(has_not_text="同步")
+                try:
+                    if await download_btn.count() > 0:
                         async with page.expect_download(timeout=60000) as dl_info:
                             await download_btn.first.click()
                         download = await dl_info.value
                         await download.save_as(save_path)
                         results.append(save_path)
-                        downloaded_titles.add(matched_title)
-                        logger.info("Downloaded video for '%s' to %s", matched_title, save_path)
+                        downloaded_ids.add(card_id)
+                        logger.info("Downloaded card %s to %s", card_id, save_path)
                         if on_progress:
-                            await on_progress(f"已下载 {len(results)}/{total} 个视频")
+                            await on_progress(f"已下载 {len(downloaded_ids)}/{expected_count} 个视频")
+                except Exception as e:
+                    logger.warning("Download failed for %s: %s", card_id, e)
+
+            elif status == "failed":
+                if card_id in retried_ids:
+                    permanently_failed_ids.add(card_id)
+                    logger.info("Card %s permanently failed (already retried)", card_id)
+                else:
+                    retried_ids.add(card_id)
+                    logger.info("Card %s failed, attempting recovery", card_id)
+                    if on_progress:
+                        await on_progress(f"任务 {card_id} 失败，正在重试...")
+                    try:
+                        await _recover_failed_task(page)
                     except Exception as e:
-                        logger.warning("Download failed for '%s': %s", matched_title, e)
+                        logger.warning("Recovery failed for %s: %s", card_id, e)
+                    # _recover_failed_task navigates back to history; refresh state
+                    await asyncio.sleep(3)
+                    continue  # next card
+
+            # status == "generating" or "unknown": skip this round, wait for next poll
+            # Close the detail panel by pressing Escape
+            try:
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(1)
             except Exception:
                 pass
 
-        if len(downloaded_titles) >= total:
+        # All done?
+        if len(downloaded_ids) + len(permanently_failed_ids) >= expected_count:
             break
 
-        # Wait 10 minutes before next poll
         if on_progress:
-            await on_progress(f"已下载 {len(results)}/{total}，10分钟后再次检查...")
+            await on_progress(
+                f"已下载 {len(downloaded_ids)}/{expected_count}，{poll_interval//60}分钟后再次检查..."
+            )
         await asyncio.sleep(poll_interval)
         elapsed += poll_interval
 
-    logger.info("Download complete: %d/%d videos", len(results), total)
+    logger.info(
+        "Download finished: %d downloaded, %d permanently failed, %d expected",
+        len(downloaded_ids), len(permanently_failed_ids), expected_count,
+    )
     return results
+
+
+async def _recover_failed_task(page: Page):
+    """On the open detail panel of a failed task: click 三点 → 在聊天中查找,
+    then click reply buttons until generation resumes, then return to history."""
+    from config import HISTORY_URL
+
+    # Click the 三点 (more) button — bottom-right of detail panel, button with no text
+    clicked_more = await page.evaluate("""() => {
+        // Find buttons in the right panel that are bottom-right and have no text
+        const btns = Array.from(document.querySelectorAll('button'));
+        // Filter: no text, in right half, bottom area, square-ish
+        const candidates = btns.filter(b => {
+            const rect = b.getBoundingClientRect();
+            const txt = (b.innerText || '').trim();
+            return !txt
+                && rect.width > 0 && rect.height > 0
+                && rect.x > window.innerWidth / 2
+                && rect.y > window.innerHeight * 0.6
+                && Math.abs(rect.width - rect.height) < 20;
+        });
+        // Sort by y descending (bottom-most first), then x descending (right-most)
+        candidates.sort((a, b) => {
+            const ra = a.getBoundingClientRect();
+            const rb = b.getBoundingClientRect();
+            return (rb.y - ra.y) || (rb.x - ra.x);
+        });
+        if (candidates.length > 0) {
+            candidates[0].click();
+            return true;
+        }
+        return false;
+    }""")
+
+    if not clicked_more:
+        logger.warning("Could not find 三点 button on detail panel")
+        await page.goto(HISTORY_URL, wait_until="domcontentloaded", timeout=30000)
+        return
+
+    await asyncio.sleep(2)
+
+    # Click "在聊天中查找" in the popup menu
+    find_chat = page.locator(':text("在聊天中查找")').last
+    try:
+        await find_chat.click(timeout=5000)
+    except Exception as e:
+        logger.warning("Could not click 在聊天中查找: %s", e)
+        await page.goto(HISTORY_URL, wait_until="domcontentloaded", timeout=30000)
+        return
+
+    # Wait for navigation to chat page
+    try:
+        await page.wait_for_url("**/chat**", timeout=15000)
+    except Exception:
+        pass
+    await asyncio.sleep(5)
+
+    # Click reply buttons until generating
+    try:
+        await wait_until_generating(page)
+        logger.info("Recovery: re-entered generating state")
+    except Exception as e:
+        logger.warning("Recovery wait_until_generating failed: %s", e)
+
+    # Return to history page to continue polling
+    await page.goto(HISTORY_URL, wait_until="domcontentloaded", timeout=30000)
+    await asyncio.sleep(5)
 
 
 async def select_trend(page: Page, category: str, trend_index: int):
