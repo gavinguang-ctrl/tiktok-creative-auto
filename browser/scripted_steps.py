@@ -573,18 +573,24 @@ async def _handle_rejection_and_retry(page: Page, rejection_count: int = 0) -> b
 
 
 async def wait_until_generating(page: Page, timeout_s: int = 300, stuck_threshold_s: int = 180):
-    """Keep clicking first reply until '正在生成视频' appears.
-    If rejection is detected, handle it and continue retrying.
+    """Keep clicking first reply until '正在生成视频' appears for THIS round.
+    Uses baseline count to ignore '正在生成视频' from prior rounds still on page.
     Returns False if stuck for stuck_threshold_s without any progress."""
+    baseline_count = await page.locator(':text("正在生成视频")').count()
+    logger.info("wait_until_generating: baseline '正在生成视频' count=%d", baseline_count)
+
     elapsed = 0
     last_action_at = 0
     rejection_count = 0
     while elapsed < timeout_s:
-        # Check if generation started
-        generating = page.locator(':text("正在生成视频")')
-        if await generating.count() > 0:
-            logger.info("Video generation started")
+        # Check if generation count INCREASED (current round started generating)
+        cur_count = await page.locator(':text("正在生成视频")').count()
+        if cur_count > baseline_count:
+            logger.info("Video generation started (count %d -> %d)", baseline_count, cur_count)
             return True
+        # If count dropped (a prior round's video finished), lower baseline so we don't wait forever
+        if cur_count < baseline_count:
+            baseline_count = cur_count
 
         # Check for rejection/error and handle it
         if await _handle_rejection_and_retry(page, rejection_count):
