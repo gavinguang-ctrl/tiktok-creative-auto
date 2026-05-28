@@ -116,15 +116,22 @@ async def download_and_advance_loop(
             logger.warning("Navigate to history failed: %s", e)
         await asyncio.sleep(8)
 
-        cards = await _extract_all_cards(page)
+        cards = await _extract_all_cards(page, window_start_str)
         logger.info("History: %d cards found", len(cards))
 
         for card in cards:
+            # Skip cards outside time window without opening
+            if not card.get("inWindow", True):
+                continue
+            cid = card.get("name", "")
+            if cid and (cid in downloaded_ids or cid in permanently_failed_ids):
+                continue
+
             if not await _click_card_open_popup(page, card):
                 continue
 
             info = await _get_popup_status(page, window_start_str)
-            cid = info.get("name", f"card_{card['index']}")
+            cid = info.get("name", cid or f"card_{card['index']}")
 
             if cid in downloaded_ids or cid in permanently_failed_ids:
                 await _close_popup(page)
@@ -168,12 +175,12 @@ async def download_and_advance_loop(
     return results
 
 
-async def _extract_all_cards(page: Page) -> list[dict]:
-    """Get all visible history cards by size."""
+async def _extract_all_cards(page: Page, window_start_str: str = "") -> list[dict]:
+    """Get all visible history cards by size, with name extracted from card text."""
     for _ in range(15):
-        count = await page.evaluate("""() => {
+        cards = await page.evaluate("""(windowStart) => {
             const seen = new Set();
-            let n = 0;
+            const results = [];
             for (const d of document.querySelectorAll('div')) {
                 const r = d.getBoundingClientRect();
                 if (r.width < 180 || r.width > 280 || r.height < 350 || r.height > 450) continue;
@@ -181,15 +188,20 @@ async def _extract_all_cards(page: Page) -> list[dict]:
                 const k = Math.round(r.x) + ',' + Math.round(r.y + window.scrollY);
                 if (seen.has(k)) continue;
                 seen.add(k);
-                n++;
+                const txt = (d.innerText || '');
+                const m = txt.match(/Creative agent_(\\d{14})/);
+                const name = m ? 'Creative agent_' + m[1] : '';
+                const ts = m ? m[1] : '';
+                const inWindow = !windowStart || !ts || ts >= windowStart;
+                results.push({ index: results.length, name, ts, inWindow });
             }
-            return n;
-        }""")
-        if count > 0:
+            return results;
+        }""", window_start_str)
+        if len(cards) > 0:
             break
         await asyncio.sleep(2)
-    logger.info("History page: %d cards found", count)
-    return [{"index": i} for i in range(count)]
+    logger.info("History page: %d cards found", len(cards))
+    return cards
 
 
 async def _click_card_open_popup(page: Page, card: dict) -> bool:
