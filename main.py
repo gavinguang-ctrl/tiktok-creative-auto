@@ -16,7 +16,10 @@ from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 
 from config import BASE_DIR, UPLOADS_DIR, DOWNLOADS_DIR, DEFAULT_CATEGORIES, DATA_DIR, SUBCATEGORIES_FILE
 from browser.manager import browser_manager
-from browser.scripted_steps import run_scripted_steps, wait_until_generating, download_all_videos, scrape_all_subcategories
+from browser import (
+    run_scripted_steps, advance_single_conversation,
+    download_and_advance_loop, scrape_all_subcategories, ImageUploadFailed,
+)
 from models.schemas import InputData, TaskStatus
 from services.template import render_prompt
 
@@ -164,90 +167,93 @@ async def run_workflow(
 
 async def _run_task(task_id: str, input_data: InputData):
     from datetime import datetime
+    from config import SINGLE_CONV_BUDGET_S
     tasks[task_id].status = "running"
     task_started_at = datetime.now()
     try:
         page = await browser_manager.open_tiktok()
-        successful_submissions = 0
 
-        # For each video: complete the full flow until "正在生成视频" before moving to next
+        # ── Phase 0: Serial submit + advance each to "正在生成视频" ──
+        submitted_titles: list[str] = []
+        dead_titles: list[str] = []
+        pending_advance_titles: list[str] = []
+
         for i in range(input_data.video_count):
             if tasks[task_id].status == "stopped":
                 logger.info("Task %s stopped by user", task_id)
                 break
 
             trend_idx = input_data.start_trend_index + i
-            retry_count = 0
-            max_retries = 2
-            success = False
+            tasks[task_id].current_video = i + 1
+            tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 提交中..."
+            await _broadcast(task_id, tasks[task_id].model_dump())
 
-            while retry_count <= max_retries and not success:
-                if tasks[task_id].status == "stopped":
-                    break
-                tasks[task_id].current_video = i + 1
-                attempt_msg = f" (重试{retry_count})" if retry_count > 0 else ""
-                tasks[task_id].message = f"[{i+1}/{input_data.video_count}]{attempt_msg} 提交中..."
+            async def on_progress(msg: str):
+                tasks[task_id].message = f"[{i+1}/{input_data.video_count}] {msg}"
                 await _broadcast(task_id, tasks[task_id].model_dump())
 
-                async def on_progress(msg: str):
-                    tasks[task_id].message = f"[{i+1}/{input_data.video_count}]{attempt_msg} {msg}"
-                    await _broadcast(task_id, tasks[task_id].model_dump())
+            # Submit: fill prompt, upload images, select trend, send
+            try:
+                title = await run_scripted_steps(page, input_data, trend_index=trend_idx, on_progress=on_progress)
+            except ImageUploadFailed as e:
+                logger.warning("Round %d image upload failed: %s", i+1, e)
+                tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 图片上传失败，跳过"
+                await _broadcast(task_id, tasks[task_id].model_dump())
+                continue
+            except Exception as e:
+                logger.warning("Round %d scripted steps failed: %s", i+1, e)
+                continue
 
-                # Fill prompt, upload images, select trend, send
-                try:
-                    title = await run_scripted_steps(page, input_data, trend_index=trend_idx, on_progress=on_progress)
-                except Exception as e:
-                    logger.warning("Round %d attempt %d scripted steps failed: %s", i+1, retry_count+1, e)
-                    retry_count += 1
-                    continue
+            if not title:
+                logger.warning("Round %d returned no title (pre-send failure), skipping", i+1)
+                continue
 
-                if not title:
-                    logger.warning("Round %d attempt %d returned no title", i+1, retry_count+1)
-                    retry_count += 1
-                    continue
+            submitted_titles.append(title)
+            logger.info("Round %d: send successful, title=%r, entering advance phase", i+1, title)
 
-                # Click replies until "正在生成视频" appears
-                try:
-                    tasks[task_id].message = f"[{i+1}/{input_data.video_count}]{attempt_msg} 点击回复中，等待进入生成状态..."
-                    await _broadcast(task_id, tasks[task_id].model_dump())
-                    generating = await wait_until_generating(page)
-                    if generating:
-                        successful_submissions += 1
-                        tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 已进入生成状态"
-                        await _broadcast(task_id, tasks[task_id].model_dump())
-                        success = True
-                    else:
-                        logger.warning("Round %d attempt %d: stuck waiting for generation", i+1, retry_count+1)
-                        retry_count += 1
-                except Exception as e:
-                    logger.warning("Round %d attempt %d wait_until_generating failed: %s", i+1, retry_count+1, e)
-                    retry_count += 1
+            # Advance to generating state
+            tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 等待进入生成状态..."
+            await _broadcast(task_id, tasks[task_id].model_dump())
 
-            if not success:
-                logger.warning("Round %d failed after %d retries, skipping", i+1, max_retries)
-                tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 重试{max_retries}次仍失败，跳过"
+            outcome = await advance_single_conversation(page, budget_s=SINGLE_CONV_BUDGET_S)
+            logger.info("Round %d: advance outcome=%s", i+1, outcome)
+            if outcome == "generating":
+                tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 已进入生成状态"
+                await _broadcast(task_id, tasks[task_id].model_dump())
+            elif outcome == "dead":
+                dead_titles.append(title)
+                tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 页面卡死，跳过"
+                await _broadcast(task_id, tasks[task_id].model_dump())
+            else:  # needs_more_time
+                pending_advance_titles.append(title)
+                tasks[task_id].message = f"[{i+1}/{input_data.video_count}] 超时未确认生成，留待后续检查"
                 await _broadcast(task_id, tasks[task_id].model_dump())
 
-        # All submitted and generating, now navigate to history page and download
+        # ── Phase 1: Download + advance pending (parallel loop) ──
         if tasks[task_id].status == "stopped":
             return
 
-        if successful_submissions == 0:
+        effective_count = len(submitted_titles) - len(dead_titles)
+        if effective_count == 0:
             tasks[task_id].status = "failed"
             tasks[task_id].message = "所有提交都失败，无任务可下载"
             await _broadcast(task_id, tasks[task_id].model_dump())
             return
 
-        tasks[task_id].message = f"全部已提交（成功 {successful_submissions}），切换到历史页等待下载..."
+        tasks[task_id].message = f"提交完成({len(submitted_titles)}个)，进入下载+补救循环..."
         await _broadcast(task_id, tasks[task_id].model_dump())
-        logger.info("Task %s: %d successful submissions, started at %s", task_id, successful_submissions, task_started_at)
+        logger.info("Task %s: %d submitted, %d dead, %d pending, started at %s",
+                    task_id, len(submitted_titles), len(dead_titles), len(pending_advance_titles), task_started_at)
 
         async def on_download_progress(msg: str):
             tasks[task_id].message = msg
             await _broadcast(task_id, tasks[task_id].model_dump())
 
-        results = await download_all_videos(
-            page, task_id, task_started_at, successful_submissions,
+        results = await download_and_advance_loop(
+            page, task_id, task_started_at,
+            submitted_titles=submitted_titles,
+            dead_titles=dead_titles,
+            pending_advance_titles=pending_advance_titles,
             on_progress=on_download_progress,
         )
         tasks[task_id].result_paths = results

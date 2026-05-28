@@ -61,15 +61,22 @@
 
 ```
 tiktok_creative_auto/
-├── main.py              # FastAPI 服务入口
-├── config.py            # 配置（选择器、类目等）
+├── main.py              # FastAPI 服务入口 + 任务调度
+├── config.py            # 配置（选择器、超时、路径）
 ├── browser/
+│   ├── __init__.py      # 公共 API 导出
 │   ├── manager.py       # Chrome CDP 连接管理
-│   └── scripted_steps.py # 自动化操作逻辑
+│   ├── helpers.py       # 底层工具（重试、CDP点击、元素查找）
+│   ├── images.py        # 图片上传（粘贴、卡住检测、清理）
+│   ├── trends.py        # 趋势选择（行业、子分类、确认）
+│   ├── chat.py          # 对话交互（发送、回复、生成检测）
+│   ├── history.py       # 历史页下载（轮询、去重、状态筛选）
+│   └── orchestrator.py  # 单轮提交主流程
 ├── models/
 │   └── schemas.py       # 数据模型
 ├── services/
-│   └── template.py      # 提示词模板
+│   ├── template.py      # 提示词模板
+│   └── translate.py     # 翻译服务
 ├── static/              # 前端页面
 ├── setup.bat            # 首次安装脚本
 ├── start.bat            # 启动脚本

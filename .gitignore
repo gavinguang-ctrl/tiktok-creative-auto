@@ -26,3 +26,4 @@ debug*.png
 debug*.txt
 *.html
 data/
+*.log
